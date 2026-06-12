@@ -100,9 +100,21 @@ erpnext.stock.LandedCostVoucher = class LandedCostVoucher extends erpnext.stock.
 					var diff = this.frm.doc.total_taxes_and_charges - flt(total_charges);
 					this.frm.doc.items.slice(-1)[0].applicable_charges += diff;
 				}
-				refresh_field("items");
 			}
+
+			this.set_landed_rate_on_items();
+			refresh_field("items");
 		}
+	}
+
+	set_landed_rate_on_items() {
+		$.each(this.frm.doc.items || [], function (i, item) {
+			var per_unit_lc = flt(item.qty) ? flt(item.applicable_charges) / flt(item.qty) : 0.0;
+			item.rate_with_lc = flt(item.rate) + per_unit_lc;
+			item.lc_percent = flt(item.amount)
+				? (flt(item.applicable_charges) / flt(item.amount)) * 100.0
+				: 0.0;
+		});
 	}
 	distribute_charges_based_on(frm) {
 		this.set_applicable_charges_for_item();
@@ -114,6 +126,18 @@ erpnext.stock.LandedCostVoucher = class LandedCostVoucher extends erpnext.stock.
 };
 
 cur_frm.script_manager.make(erpnext.stock.LandedCostVoucher);
+
+frappe.ui.form.on("Landed Cost Item", {
+	applicable_charges: function (frm, cdt, cdn) {
+		var item = locals[cdt][cdn];
+		var per_unit_lc = flt(item.qty) ? flt(item.applicable_charges) / flt(item.qty) : 0.0;
+		item.rate_with_lc = flt(item.rate) + per_unit_lc;
+		item.lc_percent = flt(item.amount)
+			? (flt(item.applicable_charges) / flt(item.amount)) * 100.0
+			: 0.0;
+		refresh_field("items");
+	},
+});
 
 frappe.ui.form.on("Landed Cost Taxes and Charges", {
 	expense_account: function (frm, cdt, cdn) {
@@ -181,6 +205,18 @@ frappe.ui.form.on("Landed Cost Purchase Receipt", {
 	},
 });
 
+function refresh_taxes_from_vendor_invoices(frm) {
+	frappe.call({
+		method: "refresh_taxes_from_vendor_invoices",
+		doc: frm.doc,
+		callback: function () {
+			frm.refresh_field("taxes");
+			frm.refresh_field("total_taxes_and_charges");
+			frm.refresh_field("total_vendor_invoices_cost");
+		},
+	});
+}
+
 frappe.ui.form.on("Landed Cost Vendor Invoice", {
 	vendor_invoice(frm, cdt, cdn) {
 		var d = locals[cdt][cdn];
@@ -195,9 +231,14 @@ frappe.ui.form.on("Landed Cost Vendor Invoice", {
 					if (r.message) {
 						$.extend(d, r.message);
 						refresh_field("vendor_invoices");
+						refresh_taxes_from_vendor_invoices(frm);
 					}
 				},
 			});
 		}
+	},
+
+	vendor_invoices_remove(frm) {
+		refresh_taxes_from_vendor_invoices(frm);
 	},
 });

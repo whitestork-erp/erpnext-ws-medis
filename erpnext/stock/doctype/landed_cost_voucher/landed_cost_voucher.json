@@ -83,6 +83,7 @@
    "fieldtype": "Table",
    "label": "Landed Cost",
    "options": "Landed Cost Taxes and Charges",
+   "read_only": 1,
    "reqd": 1
   },
   {

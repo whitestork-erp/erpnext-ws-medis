@@ -79,6 +79,7 @@ class LandedCostVoucher(Document):
 		self.check_mandatory()
 		self.validate_receipt_documents()
 		self.validate_line_items()
+		self.set_taxes_from_vendor_invoices()
 		self.validate_expense_accounts()
 		init_landed_taxes_and_totals(self)
 		self.set_total_taxes_and_charges()
@@ -86,6 +87,60 @@ class LandedCostVoucher(Document):
 			self.get_items_from_purchase_receipts()
 
 		self.set_applicable_charges_on_item()
+		self.set_total_vendor_invoices_cost()
+
+	def set_taxes_from_vendor_invoices(self):
+		"""Rebuild the taxes (Landed Cost) table from all linked Vendor Invoices.
+
+		Rows are consolidated by (expense_account, description) so each account +
+		description appears exactly once, regardless of the same item appearing
+		multiple times in an invoice or across multiple vendor invoices.
+		"""
+		if not self.get("vendor_invoices"):
+			return
+
+		consolidated = {}
+		order = []
+
+		for row in self.get("vendor_invoices"):
+			if not row.vendor_invoice:
+				continue
+
+			pi_items = frappe.get_all(
+				"Purchase Invoice Item",
+				filters={"parent": row.vendor_invoice},
+				fields=["expense_account", "item_name", "base_amount"],
+				order_by="idx",
+			)
+
+			for it in pi_items:
+				if not it.expense_account:
+					continue
+
+				key = (it.expense_account, it.item_name)
+				if key not in consolidated:
+					consolidated[key] = 0.0
+					order.append(key)
+				consolidated[key] += flt(it.base_amount)
+
+		self.set("taxes", [])
+		for expense_account, description in order:
+			self.append(
+				"taxes",
+				{
+					"expense_account": expense_account,
+					"description": description,
+					"amount": consolidated[(expense_account, description)],
+				},
+			)
+
+	@frappe.whitelist()
+	def refresh_taxes_from_vendor_invoices(self):
+		"""Whitelisted entry point used by the client to rebuild the taxes table
+		whenever a Vendor Invoice row is added or removed."""
+		self.set_taxes_from_vendor_invoices()
+		init_landed_taxes_and_totals(self)
+		self.set_total_taxes_and_charges()
 		self.set_total_vendor_invoices_cost()
 
 	def set_total_vendor_invoices_cost(self):
@@ -292,12 +347,17 @@ class LandedCostVoucher(Document):
 		self.update_claimed_landed_cost()
 
 	def update_claimed_landed_cost(self):
+		submitted = self.docstatus == 1
 		for row in self.vendor_invoices:
 			frappe.db.set_value(
 				"Purchase Invoice",
 				row.vendor_invoice,
-				"claimed_landed_cost_amount",
-				flt(row.amount, row.precision("amount")) if self.docstatus == 1 else 0.0,
+				{
+					"claimed_landed_cost_amount": flt(row.amount, row.precision("amount"))
+					if submitted
+					else 0.0,
+					"custom_lcv": self.name if submitted else None,
+				},
 			)
 
 	def update_landed_cost(self):
@@ -475,14 +535,36 @@ def get_vendor_invoices(doctype, txt, searchfield, start, page_len, filters):
 		frappe.throw(_("Invalid search query"), title=_("Invalid Query"))
 
 	query = get_vendor_invoice_query(filters)
-
+	print('---------------------->',query)  # TODO: remove after testing
 	if txt:
-		query = query.where(frappe.qb.DocType(doctype).name.like(f"%{txt}%"))
+		pi = frappe.qb.DocType("Purchase Invoice")
+		query = query.where(
+			pi.name.like(f"%{txt}%")
+			| pi.supplier_name.like(f"%{txt}%")
+			| pi.bill_no.like(f"%{txt}%")
+		)
 
-	if start:
-		query = query.limit(page_len).offset(start)
+	if page_len:
+		query = query.limit(page_len).offset(start or 0)
 
-	return query.run(as_list=True)
+	rows = query.run(as_dict=True)
+
+	print('---------------------->',rows) 
+	result = []
+	for row in rows:
+		amount = frappe.utils.fmt_money(
+			flt(row.grand_total), currency=row.currency
+		)
+		result.append(
+			[
+				row.name,
+				row.supplier_name or row.supplier,
+				row.bill_no or "",
+				amount,
+			]
+		)
+
+	return result
 
 
 def get_vendor_invoice_query(filters):
@@ -498,8 +580,17 @@ def get_vendor_invoice_query(filters):
 		.on(item.name == child_doctype.item_code)
 		.select(
 			doctype.name,
+			doctype.supplier,
+			doctype.supplier_name,
+			doctype.bill_no,
+			doctype.grand_total,
+			doctype.currency,
+			doctype.claimed_landed_cost_amount,
+			doctype.base_grand_total,
+			doctype.base_total,
 			(doctype.base_total - doctype.claimed_landed_cost_amount).as_("unclaimed_amount"),
 		)
+		.distinct()
 		.where(
 			(doctype.docstatus == 1)
 			& (doctype.is_subcontracted == 0)
@@ -507,6 +598,7 @@ def get_vendor_invoice_query(filters):
 			& (doctype.update_stock == 0)
 			& (doctype.company == filters.get("company"))
 			& (item.is_stock_item == 0)
+			& (item.is_fixed_asset == 0)
 		)
 		.having(frappe.qb.Field("unclaimed_amount") > 0)
 	)
